@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>定石ノート</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: 'Hiragino Kaku Gothic ProN','Yu Gothic','Noto Sans JP',sans-serif; }
+  .mincho { font-family: 'Hiragino Mincho ProN','Yu Mincho','Noto Serif JP',serif; }
+</style>
+</head>
+<body class="bg-stone-100">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+// ---------- 保存キー ----------
+const KEY_API = "teiseki_apikey";
+const KEY_FIELD = "teiseki_field";
+const KEY_META = "teiseki_meta";
+
+const loadLS = (k, fb) => {
+  try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; }
+  catch { return fb; }
+};
+const saveLS = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+
+// ---------- API ----------
+async function callClaude(content, maxTokens = 4000) {
+  const apiKey = localStorage.getItem(KEY_API) || "";
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: maxTokens,
+      messages: [{ role: "user", content }],
+    }),
+  });
+  const raw = await res.text();
+  let data;
+  try { data = JSON.parse(raw); }
+  catch { throw new Error("APIから不正な応答: " + raw.slice(0, 150)); }
+  if (data.error) {
+    const msg = data.error.message || "";
+    if (msg.includes("api-key") || msg.includes("authentication") || res.status === 401)
+      throw new Error("APIキーが無効。設定（⚙）から入力し直して");
+    if (res.status === 429) throw new Error("リクエスト過多。少し待ってから再実行");
+    if (msg.includes("credit") || msg.includes("billing"))
+      throw new Error("APIクレジット不足。console.anthropic.comで残高を確認");
+    throw new Error(msg.slice(0, 200));
+  }
+  if (!Array.isArray(data.content)) throw new Error("応答形式が想定外");
+  return data.content.map((i) => (i.type === "text" ? i.text : "")).join("\n");
+}
+
+function parseJSON(text) {
+  const clean = text.replace(/```json|```/g, "").trim();
+  const start = Math.min(
+    ...["[", "{"].map((c) => { const i = clean.indexOf(c); return i === -1 ? Infinity : i; })
+  );
+  return JSON.parse(clean.slice(start));
+}
+
+// ---------- 画像→JPEG base64（HEIC・大容量対策）----------
+function fileToJpegBase64(file) {
+  return new Promise((res, rej) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const MAX = 1568;
+        let w = img.width, h = img.height;
+        const s = Math.min(1, MAX / Math.max(w, h));
+        w = Math.round(w * s); h = Math.round(h * s);
+        const c = document.createElement("canvas");
+        c.width = w; c.height = h;
+        const ctx = c.getContext("2d");
+        ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        const d = c.toDataURL("image/jpeg", 0.85);
+        URL.revokeObjectURL(url);
+        res(d.split(",")[1]);
+      } catch { URL.revokeObjectURL(url); rej(new Error("画像の変換に失敗")); }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error("画像を読み込めない（スクショかJPEGで試して）")); };
+    img.src = url;
+  });
+}
+
+async function filesToImageBlocks(files) {
+  const out = [];
+  for (const f of files) {
+    const b64 = await fileToJpegBase64(f);
+    out.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } });
+  }
+  return out;
+}
+
+// ---------- UI部品 ----------
+function LayerBadge({ layer }) {
+  const m = layer === "横断";
+  return (
+    <span className={"inline-block px-2 py-0.5 text-xs font-bold rounded " +
+      (m ? "bg-orange-100 text-orange-800 border border-orange-300"
+         : "bg-indigo-100 text-indigo-800 border border-indigo-300")}>
+      {m ? "横断" : "分野"}
+    </span>
+  );
+}
+
+function TacticCard({ t, onDelete, onToggleLayer }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="border border-stone-300 rounded-lg bg-white overflow-hidden">
+      <button onClick={() => setOpen(!open)} className="w-full text-left px-3 py-2 flex items-center gap-2">
+        <LayerBadge layer={t.層} />
+        {t.層 === "分野" && t.分野 && <span className="text-xs text-stone-500 shrink-0">{t.分野}</span>}
+        <span className="text-sm font-bold text-stone-800 flex-1">{t.定石名}</span>
+        <span className="text-stone-400 text-xs">{open ? "▲" : "▼"}</span>
+      </button>
+      {open && (
+        <div className="px-3 pb-3 text-sm text-stone-700 space-y-2 border-t border-stone-100 pt-2">
+          <p><span className="font-bold text-stone-500 text-xs">{t.層 === "横断" ? "発動条件：" : "適用条件："}</span>{t.適用条件}</p>
+          <p className="whitespace-pre-wrap"><span className="font-bold text-stone-500 text-xs">手順：</span>{t.手順}</p>
+          {t.注意点 && <p><span className="font-bold text-red-600 text-xs">注意：</span>{t.注意点}</p>}
+          <div className="flex gap-2 pt-1">
+            {onToggleLayer && (
+              <button onClick={() => onToggleLayer(t.id)} className="text-xs px-2 py-1 rounded border border-stone-300 text-stone-600">
+                層を{t.層 === "横断" ? "分野" : "横断"}に変更
+              </button>
+            )}
+            {onDelete && (
+              <button onClick={() => onDelete(t.id)} className="text-xs px-2 py-1 rounded border border-red-300 text-red-600">削除</button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- メイン ----------
+function App() {
+  const [apiKey, setApiKey] = useState(localStorage.getItem(KEY_API) || "");
+  const [showSettings, setShowSettings] = useState(!localStorage.getItem(KEY_API));
+  const [keyInput, setKeyInput] = useState("");
+
+  const [tab, setTab] = useState("solve");
+  const [fieldTactics, setFieldTactics] = useState(() => loadLS(KEY_FIELD, []));
+  const [metaTactics, setMetaTactics] = useState(() => loadLS(KEY_META, []));
+
+  const persist = (nf, nm) => {
+    saveLS(KEY_FIELD, nf); saveLS(KEY_META, nm);
+    setFieldTactics(nf); setMetaTactics(nm);
+  };
+
+  // ===== 登録 =====
+  const [regFiles, setRegFiles] = useState([]);
+  const [regText, setRegText] = useState("");
+  const [extracting, setExtracting] = useState(false);
+  const [pending, setPending] = useState([]);
+  const [regError, setRegError] = useState("");
+
+  const extract = async () => {
+    setRegError(""); setExtracting(true); setPending([]);
+    try {
+      const content = [];
+      if (regFiles.length) content.push(...(await filesToImageBlocks(regFiles)));
+      content.push({ type: "text", text:
+`あなたは高校数学の定石を整理するアシスタント。${regFiles.length ? "画像（ノートや参考書）" : ""}${regFiles.length && regText ? "と" : ""}${regText ? "テキスト" : ""}から数学の定石を抽出し、JSON配列のみを出力せよ。前置き・コードブロック記号は一切不要。
+
+各要素の形式:
+{"層":"分野" または "横断","分野":"数学の分野名（横断の場合は空文字）","定石名":"短い名前","適用条件":"いつ使うか（横断なら発動条件となる問題文の特徴）","手順":"具体的な手順","注意点":"ミスしやすい点（なければ空文字）"}
+
+層の判定基準: 特定の単元に固有なら「分野」、全称命題の処理・逆像法・必要条件で絞る等、単元をまたぐ思考法なら「横断」。
+分野名は「数と式」「二次関数」「図形と方程式」「三角関数」「指数対数」「微分」「積分」「数列」「ベクトル」「確率」「整数」「複素数平面」「極限」のような標準的な単元名を使え。${regText ? "\n\nテキスト:\n" + regText : ""}` });
+      const raw = await callClaude(content, 4000);
+      const arr = parseJSON(raw);
+      setPending(arr.map((t, i) => ({ ...t, id: `t_${Date.now()}_${i}` })));
+    } catch (e) { setRegError("抽出に失敗: " + e.message); }
+    setExtracting(false);
+  };
+
+  const savePending = () => {
+    persist(
+      [...fieldTactics, ...pending.filter((t) => t.層 === "分野")],
+      [...metaTactics, ...pending.filter((t) => t.層 === "横断")]
+    );
+    setPending([]); setRegFiles([]); setRegText("");
+    document.querySelectorAll('input[type="file"]').forEach((el) => (el.value = ""));
+  };
+
+  // ===== 一覧 =====
+  const [filterField, setFilterField] = useState("all");
+  const allFields = [...new Set(fieldTactics.map((t) => t.分野).filter(Boolean))];
+  const deleteSaved = (id) =>
+    persist(fieldTactics.filter((t) => t.id !== id), metaTactics.filter((t) => t.id !== id));
+
+  // ===== バックアップ =====
+  const exportJSON = () => {
+    const blob = new Blob(
+      [JSON.stringify({ field: fieldTactics, meta: metaTactics }, null, 2)],
+      { type: "application/json" }
+    );
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `teiseki_backup_${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  const importJSON = (file) => {
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const d = JSON.parse(r.result);
+        const ids = new Set([...fieldTactics, ...metaTactics].map((t) => t.id));
+        persist(
+          [...fieldTactics, ...(d.field || []).filter((t) => !ids.has(t.id))],
+          [...metaTactics, ...(d.meta || []).filter((t) => !ids.has(t.id))]
+        );
+        alert("読み込み完了");
+      } catch { alert("読み込み失敗：ファイル形式を確認して"); }
+    };
+    r.readAsText(file);
+  };
+
+  // ===== 解答 =====
+  const [probFile, setProbFile] = useState(null);
+  const [probText, setProbText] = useState("");
+  const [solving, setSolving] = useState(false);
+  const [solveStep, setSolveStep] = useState("");
+  const [analysis, setAnalysis] = useState(null);
+  const [solution, setSolution] = useState("");
+  const [solveError, setSolveError] = useState("");
+
+  const solve = async () => {
+    setSolveError(""); setSolution(""); setAnalysis(null); setSolving(true);
+    try {
+      const imgBlocks = probFile ? await filesToImageBlocks([probFile]) : [];
+
+      setSolveStep("問題を分析中…");
+      let cls = { 分野: [], 構造: [] };
+      let classifyFailed = false;
+      try {
+        const fieldList = allFields.length ? allFields.join("、") : "（登録済み分野なし）";
+        const clsRaw = await callClaude([
+          ...imgBlocks,
+          { type: "text", text:
+`この高校数学の問題を分析し、JSONのみ出力せよ。形式: {"分野":["該当する分野名"],"構造":["問題の構造的特徴を短く"]}
+分野は次の登録済みリストから該当するものを優先的に選べ（複数可）: ${fieldList}
+リストにない場合は標準的な単元名で答えよ。${probText ? "\n\n問題:\n" + probText : ""}` },
+        ], 500);
+        cls = parseJSON(clsRaw);
+        setAnalysis(cls);
+      } catch { classifyFailed = true; }
+
+      setSolveStep("定石を照合して解答を作成中…");
+      const matched = classifyFailed ? fieldTactics :
+        fieldTactics.filter((t) =>
+          (cls.分野 || []).some((f) => t.分野 && (t.分野.includes(f) || f.includes(t.分野))));
+      const fmt = (t) => `・【${t.定石名}】条件: ${t.適用条件} / 手順: ${t.手順}${t.注意点 ? " / 注意: " + t.注意点 : ""}`;
+      const metaBlock = metaTactics.length
+        ? "《横断定石（発動条件に合致すれば最優先で適用し問題を読み替える）》\n" + metaTactics.map(fmt).join("\n") : "";
+      const fieldBlock = matched.length ? "《分野定石》\n" + matched.map(fmt).join("\n") : "";
+
+      const sol = await callClaude([
+        ...imgBlocks,
+        { type: "text", text:
+`あなたは高校数学の講師。以下の定石集をベースに、この問題の解答を作成せよ。
+
+${metaBlock}
+
+${fieldBlock}
+
+${!metaBlock && !fieldBlock ? "（登録された定石はまだない。標準的な解法で解け）" : ""}
+
+出力形式:
+【使用した定石】使った定石名を列挙し、なぜその定石が発動するか一言ずつ
+【解答】定石の手順に沿った答案。数式は平文で読みやすく（例: x^2, √3, ∫f(x)dx）
+【補足】定石集にない技法を使った場合や、定石として登録する価値のある考え方があれば指摘
+
+高校数学の範囲を厳守。${probText ? "\n\n問題:\n" + probText : ""}` },
+      ], 4000);
+      setSolution(sol);
+    } catch (e) { setSolveError("失敗: " + e.message); }
+    setSolving(false); setSolveStep("");
+  };
+
+  // ---------- render ----------
+  const tabs = [
+    { id: "solve", label: "問題を解く" },
+    { id: "register", label: "定石を登録" },
+    { id: "list", label: `定石一覧（${fieldTactics.length + metaTactics.length}）` },
+  ];
+
+  return (
+    <div className="min-h-screen">
+      <header className="bg-indigo-950 text-white px-4 pt-5 pb-3">
+        <div className="flex items-start justify-between">
+          <div>
+            <h1 className="text-2xl tracking-widest mincho">定石ノート</h1>
+            <p className="text-indigo-300 text-xs mt-1">分野定石 × 横断定石 の二層構造で解答を組み立てる</p>
+          </div>
+          <button onClick={() => { setKeyInput(apiKey); setShowSettings(true); }}
+            className="text-indigo-300 text-xl" aria-label="設定">⚙</button>
+        </div>
+        <nav className="flex gap-1 mt-4 -mb-3">
+          {tabs.map((t) => (
+            <button key={t.id} onClick={() => setTab(t.id)}
+              className={"px-3 py-2 text-sm rounded-t-lg " +
+                (tab === t.id ? "bg-stone-100 text-indigo-950 font-bold" : "bg-indigo-900 text-indigo-300")}>
+              {t.label}
+            </button>
+          ))}
+        </nav>
+      </header>
+
+      <main className="max-w-2xl mx-auto p-4 pb-16">
+        {/* ===== 設定モーダル ===== */}
+        {showSettings && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-lg p-4 w-full max-w-md space-y-3">
+              <h2 className="font-bold text-stone-800">APIキー設定</h2>
+              <p className="text-xs text-stone-500">
+                console.anthropic.com で発行したキーを入力。この端末のブラウザにのみ保存され、外部には送信されない（API通信を除く）。
+              </p>
+              <input type="password" value={keyInput} onChange={(e) => setKeyInput(e.target.value)}
+                placeholder="sk-ant-..." className="w-full border border-stone-300 rounded p-2 text-sm" />
+              <div className="flex gap-2">
+                <button onClick={() => {
+                    localStorage.setItem(KEY_API, keyInput.trim());
+                    setApiKey(keyInput.trim()); setShowSettings(false);
+                  }}
+                  disabled={!keyInput.trim()}
+                  className="flex-1 py-2 rounded bg-indigo-800 text-white font-bold disabled:bg-stone-300">保存</button>
+                {apiKey && (
+                  <button onClick={() => setShowSettings(false)}
+                    className="px-4 py-2 rounded border border-stone-300 text-stone-600">閉じる</button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ===== 解答 ===== */}
+        {tab === "solve" && (
+          <div className="space-y-4">
+            <div className="bg-white rounded-lg border border-stone-300 p-4 space-y-3">
+              <label className="block text-sm font-bold text-stone-700">問題の写真
+                <input type="file" accept="image/*"
+                  onChange={(e) => setProbFile(e.target.files[0] || null)}
+                  className="block mt-1 text-sm text-stone-600" />
+              </label>
+              <label className="block text-sm font-bold text-stone-700">またはテキストで入力
+                <textarea value={probText} onChange={(e) => setProbText(e.target.value)} rows={3}
+                  placeholder="例: すべての実数xに対して x^2 + ax + 3 ≧ 0 が成り立つようなaの範囲を求めよ"
+                  className="block w-full mt-1 border border-stone-300 rounded p-2 text-sm" />
+              </label>
+              <button onClick={solve} disabled={solving || (!probFile && !probText.trim())}
+                className="w-full py-2 rounded bg-indigo-800 text-white font-bold disabled:bg-stone-300">
+                {solving ? solveStep || "処理中…" : "解答を作成"}
+              </button>
+              {solveError && <p className="text-sm text-red-600">{solveError}</p>}
+            </div>
+
+            {analysis && (
+              <div className="bg-white rounded-lg border border-stone-300 p-3 text-sm">
+                <span className="font-bold text-stone-500 text-xs">判定：</span>
+                {(analysis.分野 || []).map((f) => (
+                  <span key={f} className="inline-block bg-indigo-100 text-indigo-800 rounded px-2 py-0.5 text-xs mr-1">{f}</span>
+                ))}
+                {(analysis.構造 || []).map((s) => (
+                  <span key={s} className="inline-block bg-orange-100 text-orange-800 rounded px-2 py-0.5 text-xs mr-1">{s}</span>
+                ))}
+              </div>
+            )}
+
+            {solution && (
+              <div className="bg-white rounded-lg border border-stone-300 p-4">
+                <pre className="whitespace-pre-wrap text-sm text-stone-800" style={{fontFamily:"inherit"}}>{solution}</pre>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ===== 登録 ===== */}
+        {tab === "register" && (
+          <div className="space-y-4">
+            <div className="bg-white rounded-lg border border-stone-300 p-4 space-y-3">
+              <label className="block text-sm font-bold text-stone-700">定石の写真（ノート・参考書、複数可）
+                <input type="file" accept="image/*" multiple
+                  onChange={(e) => setRegFiles([...e.target.files])}
+                  className="block mt-1 text-sm text-stone-600" />
+              </label>
+              {regFiles.length > 0 && <p className="text-xs text-stone-500">{regFiles.length}枚選択中</p>}
+              <label className="block text-sm font-bold text-stone-700">またはテキストで入力
+                <textarea value={regText} onChange={(e) => setRegText(e.target.value)} rows={3}
+                  placeholder="例: 「すべてのxで成り立つ」ときたら最小値問題に読み替える…"
+                  className="block w-full mt-1 border border-stone-300 rounded p-2 text-sm" />
+              </label>
+              <button onClick={extract} disabled={extracting || (!regFiles.length && !regText.trim())}
+                className="w-full py-2 rounded bg-indigo-800 text-white font-bold disabled:bg-stone-300">
+                {extracting ? "抽出中…" : "定石を抽出"}
+              </button>
+              {regError && <p className="text-sm text-red-600">{regError}</p>}
+            </div>
+
+            {pending.length > 0 && (
+              <div className="space-y-2">
+                <p className="text-sm text-stone-600 font-bold">抽出結果（層の判定を確認してから保存）</p>
+                {pending.map((t) => (
+                  <TacticCard key={t.id} t={t}
+                    onDelete={(id) => setPending((p) => p.filter((x) => x.id !== id))}
+                    onToggleLayer={(id) => setPending((p) => p.map((x) =>
+                      x.id === id ? { ...x, 層: x.層 === "横断" ? "分野" : "横断" } : x))} />
+                ))}
+                <button onClick={savePending} className="w-full py-2 rounded bg-orange-600 text-white font-bold">
+                  {pending.length}件を保存
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ===== 一覧 ===== */}
+        {tab === "list" && (
+          <div className="space-y-4">
+            <section>
+              <h2 className="text-sm font-bold text-orange-800 mb-2 mincho">
+                横断定石（毎回すべて注入・{metaTactics.length}件）
+              </h2>
+              <div className="space-y-2">
+                {metaTactics.length === 0 && (
+                  <p className="text-xs text-stone-500">まだない。「全称命題は最小値に帰着」のような分野をまたぐ思考法を登録しよう。</p>
+                )}
+                {metaTactics.map((t) => <TacticCard key={t.id} t={t} onDelete={deleteSaved} />)}
+              </div>
+            </section>
+
+            <section>
+              <h2 className="text-sm font-bold text-indigo-900 mb-2 mincho">
+                分野定石（判定した分野のみ注入・{fieldTactics.length}件）
+              </h2>
+              {allFields.length > 0 && (
+                <div className="flex flex-wrap gap-1 mb-2">
+                  <button onClick={() => setFilterField("all")}
+                    className={"text-xs px-2 py-1 rounded " +
+                      (filterField === "all" ? "bg-indigo-800 text-white" : "bg-white border border-stone-300 text-stone-600")}>
+                    すべて
+                  </button>
+                  {allFields.map((f) => (
+                    <button key={f} onClick={() => setFilterField(f)}
+                      className={"text-xs px-2 py-1 rounded " +
+                        (filterField === f ? "bg-indigo-800 text-white" : "bg-white border border-stone-300 text-stone-600")}>
+                      {f}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="space-y-2">
+                {fieldTactics.length === 0 && <p className="text-xs text-stone-500">まだない。「定石を登録」から追加。</p>}
+                {fieldTactics
+                  .filter((t) => filterField === "all" || t.分野 === filterField)
+                  .map((t) => <TacticCard key={t.id} t={t} onDelete={deleteSaved} />)}
+              </div>
+            </section>
+
+            <section className="pt-2 border-t border-stone-300">
+              <h2 className="text-sm font-bold text-stone-600 mb-2">バックアップ</h2>
+              <div className="flex gap-2">
+                <button onClick={exportJSON}
+                  className="flex-1 py-2 rounded border border-stone-400 text-stone-700 text-sm font-bold bg-white">
+                  JSONを書き出す
+                </button>
+                <label className="flex-1 py-2 rounded border border-stone-400 text-stone-700 text-sm font-bold bg-white text-center cursor-pointer">
+                  JSONを読み込む
+                  <input type="file" accept=".json,application/json" className="hidden"
+                    onChange={(e) => { if (e.target.files[0]) importJSON(e.target.files[0]); e.target.value = ""; }} />
+                </label>
+              </div>
+              <p className="text-xs text-stone-500 mt-2">
+                定石はこの端末のブラウザに保存される。機種変更前やたまの節目に書き出しておくと安心。
+              </p>
+            </section>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
